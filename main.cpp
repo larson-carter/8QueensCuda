@@ -4,72 +4,104 @@
 #include <atomic>
 #include <chrono>
 #include <mutex>
+#include <bitset>
+#include <cstring>
+#include <arm_neon.h>
 
 using namespace std;
 using namespace std::chrono;
 
 const int MAX_N = 32;
-const int PRINT_EVERY = 20000000;  // Print every 20 million solutions
-std::mutex io_mutex;  // To handle output when using multithreading
+const uint64_t PRINT_EVERY = 20000000;
+std::mutex io_mutex;
 
-// Variables for managing the state of the problem
-atomic<int> solutions_count(0);  // To track the number of solutions found
-vector<thread> threads;  // Vector to hold all the threads
+atomic<uint64_t> solutions_count(0);
+vector<thread> threads;
 
-// Function to solve N-Queens problem using bitwise manipulation (backtracking)
-void solveNQueens(int n, int row, int columns, int diag1, int diag2, vector<int>& solution) {
+// Use a lookup table for bit counting
+alignas(64) uint8_t bitCount[65536];
+
+void initBitCountLookup() {
+    for (int i = 0; i < 65536; i++) {
+        bitCount[i] = __builtin_popcount(i);
+    }
+}
+
+inline int countBits(uint32_t n) {
+#ifdef __aarch64__
+    return __builtin_popcountll(n);
+#else
+    return bitCount[n & 0xFFFF] + bitCount[(n >> 16) & 0xFFFF];
+#endif
+}
+
+bool isSymmetricPlacement(int n, uint32_t position) {
+    int col = __builtin_ctz(position);
+    return col <= n / 2;
+}
+
+void solveNQueens(const int n, const int row, const uint32_t columns, const uint32_t diag1, const uint32_t diag2, uint64_t& local_count) {
     if (row == n) {
-        int current_solution_number = ++solutions_count;
-        if (current_solution_number % PRINT_EVERY == 0) {
-            std::lock_guard<std::mutex> lock(io_mutex);
-            cout << "Solution found!: Number " << current_solution_number << endl;
-        }
+        local_count += (row == 0 || !isSymmetricPlacement(n, columns & -columns)) ? 1 : 2;
         return;
     }
 
-    int available_positions = ((1 << n) - 1) & ~(columns | diag1 | diag2);
+    uint32_t available_positions = ((1 << n) - 1) & ~(columns | diag1 | diag2);
     while (available_positions) {
-        int position = available_positions & -available_positions;  // Get the rightmost available position
-        available_positions -= position;  // Remove this position from the available set
+        uint32_t position = available_positions & -available_positions;
+        available_positions ^= position;
 
-        int col = __builtin_ctz(position);  // Find the column number from the bit position
-        solution[row] = col;
-
-        solveNQueens(n, row + 1, columns | position, (diag1 | position) << 1, (diag2 | position) >> 1, solution);
+        solveNQueens(n, row + 1, columns | position, (diag1 | position) << 1, (diag2 | position) >> 1, local_count);
     }
 }
 
-// Worker function for each thread to explore solutions
-void workerThread(int n, int row, int columns, int diag1, int diag2, vector<int> solution) {
-    solveNQueens(n, row, columns, diag1, diag2, solution);
+void workerThread(const int n, const int row, const uint32_t columns, const uint32_t diag1, const uint32_t diag2) {
+    uint64_t local_count = 0;
+    solveNQueens(n, row, columns, diag1, diag2, local_count);
+
+    uint64_t old_count, new_count;
+    do {
+        old_count = solutions_count.load(std::memory_order_relaxed);
+        new_count = old_count + local_count;
+
+        // Print progress if we've crossed a PRINT_EVERY boundary
+        uint64_t old_milestone = old_count / PRINT_EVERY;
+        uint64_t new_milestone = new_count / PRINT_EVERY;
+        if (new_milestone > old_milestone) {
+            std::lock_guard<std::mutex> lock(io_mutex);
+            cout << "Solutions found: " << new_milestone * PRINT_EVERY << endl;
+        }
+
+    } while (!solutions_count.compare_exchange_weak(old_count, new_count,
+                                                    std::memory_order_relaxed,
+                                                    std::memory_order_relaxed));
 }
 
-// Multithreaded function to solve the problem
-void multithreadedNQueens(int n) {
-    vector<int> solution(n, -1);  // Initialize solution vector
-    int first_row_available_positions = (1 << n) - 1;
+void multithreadedNQueens(const int n) {
+    uint32_t first_row_available_positions = (1 << (n + 1) / 2) - 1;  // Only iterate over half for odd n
 
-    // Split first row's available positions between threads
     while (first_row_available_positions) {
-        int position = first_row_available_positions & -first_row_available_positions;
-        first_row_available_positions -= position;
+        uint32_t position = first_row_available_positions & -first_row_available_positions;
+        first_row_available_positions ^= position;
 
-        int col = __builtin_ctz(position);  // Find column number
-        solution[0] = col;
-
-        // Launch a thread for each valid position in the first row
-        threads.push_back(thread(workerThread, n, 1, position, position << 1, position >> 1, solution));
+        threads.emplace_back(workerThread, n, 1, position, position << 1, position >> 1);
     }
 
-    // Join all threads to ensure completion
     for (auto& t : threads) {
         if (t.joinable()) {
             t.join();
         }
     }
+
+    // Double the count for odd n to account for symmetry
+    if (n % 2 == 1) {
+        solutions_count.fetch_add(solutions_count.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    }
 }
 
 int main() {
+    initBitCountLookup();
+
     int n;
     cout << "Enter the value of N for the N-Queens problem: ";
     cin >> n;
